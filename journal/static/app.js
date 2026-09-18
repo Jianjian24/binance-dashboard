@@ -24,11 +24,28 @@ const RANGE_LABELS = {
   custom: "Custom range",
 };
 const PRIVACY_KEY = "ledger-privacy";
+const PRIVACY_SALT_KEY = "ledger-privacy-salt";
 function readPrivacy() {
   try {
     return localStorage.getItem(PRIVACY_KEY) === "1";
   } catch {
     return false;
+  }
+}
+function newPrivacySalt() {
+  const c = globalThis.crypto;
+  if (c && c.getRandomValues) {
+    const buf = new Uint32Array(2);
+    c.getRandomValues(buf);
+    return [...buf].map((n) => n.toString(36)).join("");
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+}
+function readPrivacySalt() {
+  try {
+    return localStorage.getItem(PRIVACY_SALT_KEY) || "";
+  } catch {
+    return "";
   }
 }
 const state = {
@@ -37,9 +54,16 @@ const state = {
   customFrom: "",
   customTo: "",
   privacy: readPrivacy(),
+  privacySalt: "",
   raw: { kind: "fills", page: 0, symbol: "", q: "", side: "", positionSide: "", status: "" },
   renderId: 0,
 };
+if (state.privacy) {
+  state.privacySalt = readPrivacySalt() || newPrivacySalt();
+  try {
+    localStorage.setItem(PRIVACY_SALT_KEY, state.privacySalt);
+  } catch {}
+}
 
 function shanghaiDayStartMs(ms = Date.now()) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -100,8 +124,38 @@ async function api(path, opts) {
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
-function usd(n, d = 2) {
-  if (state.privacy) return "$**";
+function hash32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function privacyUnit(key) {
+  return hash32(`${state.privacySalt || "0"}:${key}`) / 4294967296;
+}
+function chartDecoy() {
+  if (!state.privacy) return 1;
+  return 8 + privacyUnit("chart:a") * 18;
+}
+function scramble(n, kind = "money") {
+  const v = Number(n);
+  if (!state.privacy || !Number.isFinite(v)) return v;
+  if (v === 0) return 0;
+  const sign = v < 0 ? -1 : 1;
+  const abs = Math.abs(v);
+  const u = privacyUnit(`${kind}:${abs.toPrecision(12)}`);
+  let factor = 8 + u * 18;
+  if (kind === "count") factor = 2.5 + u * 5;
+  else if (kind === "price" || kind === "lev") factor = 0.85 + u * 0.5;
+  else if (kind === "hold") factor = 0.8 + u * 0.7;
+  else if (kind === "pct" || kind === "roi" || kind === "stat") factor = 1.4 + u * 1.6;
+  let out = abs * factor;
+  if (kind === "count") out = Math.max(1, Math.round(out));
+  return sign * out;
+}
+function usdPlain(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   const v = Number(n);
   const abs = Math.abs(v).toLocaleString("en-US", {
@@ -110,29 +164,33 @@ function usd(n, d = 2) {
   });
   return v < 0 ? `-$${abs}` : `$${abs}`;
 }
-function signedUsd(n, d = 2) {
-  if (state.privacy) return "$**";
+function signedUsdPlain(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   const v = Number(n);
-  const body = usd(Math.abs(v), d);
+  const body = usdPlain(Math.abs(v), d);
   if (v > 0) return `+${body}`;
   if (v < 0) return `-${body}`;
   return body;
 }
+function usd(n, d = 2) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return usdPlain(scramble(n, "money"), d);
+}
+function signedUsd(n, d = 2) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return signedUsdPlain(scramble(n, "money"), d);
+}
 function count(n) {
-  if (state.privacy) return "***";
   if (n == null || Number.isNaN(Number(n))) return "0";
-  return String(n);
+  return String(Math.abs(Math.round(scramble(n, "count"))));
 }
 function priceTxt(n, digits = 5) {
   if (n == null || Number.isNaN(Number(n))) return "—";
-  if (state.privacy) return "**";
-  return Number(n).toPrecision(digits);
+  return Number(scramble(n, "price")).toPrecision(digits);
 }
 function stat(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
-  if (state.privacy) return "**";
-  return Number(n).toFixed(d);
+  return scramble(n, "stat").toFixed(d);
 }
 function clsPnl(n) {
   if (n > 0) return "up";
@@ -154,8 +212,7 @@ function fmtDay(ms) {
 }
 function holdLabel(ms) {
   if (ms == null) return "—";
-  if (state.privacy) return "**";
-  const s = Math.round(ms / 1000);
+  const s = Math.round(scramble(ms, "hold") / 1000);
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
@@ -165,9 +222,8 @@ function pct(n) {
   return `${(Number(n) * 100).toFixed(0)}%`;
 }
 function roiFromRate(rate) {
-  if (state.privacy) return "**%";
   if (rate == null || !Number.isFinite(Number(rate))) return "—";
-  const r = Number(rate) * 100;
+  const r = scramble(Number(rate), "roi") * 100;
   if (r > 0) return `+${r.toFixed(2)}%`;
   if (r < 0) return `${r.toFixed(2)}%`;
   return "0.00%";
@@ -238,7 +294,8 @@ function drawPnl(canvas, series, key = "equity", hover = null) {
   const h = (canvas.height = Math.max(220, canvas.clientHeight || 260) * dpr);
   ctx.clearRect(0, 0, w, h);
   if (!series.length) return;
-  const vals = series.map((p) => Number(p[key] || 0));
+  const a = chartDecoy();
+  const vals = series.map((p) => Number(p[key] || 0) * a);
   const times = series.map((p) => Number(p.t || 0));
   const tMin = Math.min(...times);
   const tMax = Math.max(...times);
@@ -263,7 +320,7 @@ function drawPnl(canvas, series, key = "equity", hover = null) {
   for (let i = 0; i <= ticks; i++) {
     const v = max - (span * i) / ticks;
     const y = yAt(v);
-    ctx.fillText(state.privacy ? "**" : (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(0), padL - 8 * dpr, y + 4 * dpr);
+    ctx.fillText((v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(0), padL - 8 * dpr, y + 4 * dpr);
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
     ctx.lineWidth = dpr;
     ctx.beginPath();
@@ -283,7 +340,7 @@ function drawPnl(canvas, series, key = "equity", hover = null) {
     ctx.beginPath();
     series.forEach((p, i) => {
       const x = xAt(i);
-      const y = yAt(Number(p[key] || 0));
+      const y = yAt(vals[i]);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
@@ -382,7 +439,7 @@ function bindPnlHover(canvas, series, key = "equity") {
     tip.style.display = "block";
     tip.style.left = `${Math.min(e.clientX - wrapRect.left + 12, wrapRect.width - 160)}px`;
     tip.style.top = `${Math.max(8, e.clientY - wrapRect.top - 52)}px`;
-    tip.innerHTML = `<div>${fmtTime(p.t)}</div><div><strong>${signedUsd(p[key])}</strong></div>`;
+    tip.innerHTML = `<div>${fmtTime(p.t)}</div><div><strong>${signedUsdPlain(Number(p[key] || 0) * chartDecoy())}</strong></div>`;
   };
   canvas.onmouseleave = () => {
     drawPnl(canvas, series, key);
@@ -799,7 +856,7 @@ function positionsCard(account) {
             <div class="sz ${short ? "down" : "up"}">${short ? "↘" : "↗"} ${usd(notional)}</div>
             <div class="px num-end">${priceTxt(p.entry)}</div>
             <div class="pnl-chip ${uPnl == null ? "" : clsPnl(uPnl)}">${uPnl == null ? "—" : signedUsd(uPnl)}</div>
-            <div class="lev num-end">${p.leverage ? (state.privacy ? "**x" : p.leverage + "x") : p.source === "local" ? "本地" : "—"}</div>
+            <div class="lev num-end">${p.leverage ? Math.max(1, Math.round(scramble(p.leverage, "lev"))) + "x" : p.source === "local" ? "本地" : "—"}</div>
           </div>`;
         })
         .join("")}`
@@ -881,12 +938,13 @@ function journalList(rows, opts = {}) {
           r.exit_price && r.entry_price
             ? ((Number(r.exit_price) - Number(r.entry_price)) / Number(r.entry_price)) * (short ? -1 : 1) * 100
             : null;
+        const chgFake = chg == null ? null : scramble(chg, "pct");
         return `<div class="jrow ${wide ? "wide" : ""} ${short ? "short" : ""}">
           <div class="sym-cell"><span class="avatar">${esc(initials(r.symbol))}</span><div class="sym-meta">${esc(r.symbol)}${tagPills(r.tags)}</div></div>
           <div class="sz ${short ? "down" : "up"}">${short ? "↘" : "↗"} ${usd(notional)}</div>
           <div class="tm">${fmtTime(r.open_time_ms)} → ${fmtTime(r.close_time_ms)}<small>Close time</small></div>
           ${wide ? `<div class="tm">${holdLabel(r.hold_ms)}</div>` : ""}
-          <div class="px">${priceTxt(r.entry_price)} → ${r.exit_price == null ? "—" : priceTxt(r.exit_price)}${chg == null ? "" : `<small>${state.privacy ? "**%" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`}</small>`}</div>
+          <div class="px">${priceTxt(r.entry_price)} → ${r.exit_price == null ? "—" : priceTxt(r.exit_price)}${chgFake == null ? "" : `<small>${chgFake >= 0 ? "+" : ""}${chgFake.toFixed(2)}%</small>`}</div>
           <div class="pnl-chip ${clsPnl(pnl)}">${signedUsd(pnl)}</div>
         </div>`;
       })
@@ -914,7 +972,7 @@ async function renderTrades() {
         const pnl = Number(r.realized_pnl || 0);
         return `<div class="jrow ${r.side === "SELL" ? "short" : ""}">
         <div class="sym-cell"><span class="avatar">${esc(initials(r.symbol))}</span>${esc(r.symbol)}</div>
-        <div class="sz">${r.side} ${state.privacy ? "***" : r.qty}</div>
+        <div class="sz">${r.side} ${state.privacy ? Number(scramble(r.qty, "qty")).toPrecision(6) : r.qty}</div>
         <div class="tm">${fmtTime(r.time_ms)}<small>${r.strategy_tag || ""}</small></div>
         <div class="px">${priceTxt(r.price, 6)}</div>
         <div class="pnl-chip ${clsPnl(pnl)}">${signedUsd(pnl, 4)}</div>
@@ -948,12 +1006,16 @@ function rawCell(key, value) {
   if (String(key).endsWith("_ms") || key === "time_ms") {
     return `<span title="${esc(value)}">${esc(fmtTs(value))}</span>`;
   }
-  if (state.privacy && typeof value === "number") return "***";
-  if (state.privacy && typeof value === "string" && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(value.trim())) return "***";
-  if (typeof value === "number") {
-    if (state.privacy) return "***";
-    if (Number.isInteger(value) || Math.abs(value) >= 1000) return esc(String(value));
-    return esc(String(Number(value.toPrecision(10))));
+  const asNum =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(value.trim())
+        ? Number(value)
+        : null;
+  if (asNum != null && Number.isFinite(asNum)) {
+    const n = scramble(asNum, "raw");
+    if (Number.isInteger(asNum) || Math.abs(asNum) >= 1000) return esc(String(Math.round(n)));
+    return esc(String(Number(n.toPrecision(10))));
   }
   return esc(value);
 }
@@ -1096,7 +1158,7 @@ async function renderRawdata() {
       ${table}
       <div class="raw-pager">
         <button type="button" class="btn" id="rawPrev" ${offset <= 0 ? "disabled" : ""}>上一页</button>
-        <span>${state.privacy ? "***–*** / ***" : `${start}–${end} / ${total}`}</span>
+        <span>${count(start)}–${count(end)} / ${count(total)}</span>
         <button type="button" class="btn" id="rawNext" ${end >= total ? "disabled" : ""}>下一页</button>
       </div>
     </div>`
@@ -1204,8 +1266,15 @@ function syncPrivacyBtn() {
 }
 function setPrivacy(on) {
   state.privacy = Boolean(on);
+  if (state.privacy) {
+    state.privacySalt = newPrivacySalt();
+  } else {
+    state.privacySalt = "";
+  }
   try {
     localStorage.setItem(PRIVACY_KEY, state.privacy ? "1" : "0");
+    if (state.privacy) localStorage.setItem(PRIVACY_SALT_KEY, state.privacySalt);
+    else localStorage.removeItem(PRIVACY_SALT_KEY);
   } catch {}
   syncPrivacyBtn();
 }
